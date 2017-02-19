@@ -6,9 +6,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/crowdmob/goamz/aws"
-	"github.com/crowdmob/goamz/s3"
-	"github.com/crowdmob/goamz/sqs"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/sqs"
 )
 
 func main() {
@@ -23,9 +25,9 @@ func main() {
 	flag.Parse()
 
 	// look up region
-	region, regionOk := aws.Regions[*regionName]
-	if !regionOk {
-		log.Fatalf("%q is not a valid region name", regionName)
+	sess, err := session.NewSession(&aws.Config{Region: aws.String(*regionName)})
+	if err != nil {
+		log.Fatalf("failed to create session for region %q", regionName, err)
 	}
 
 	// ensure the local path is a directory
@@ -35,39 +37,44 @@ func main() {
 		log.Fatalf("%q is not a directory", localPath)
 	}
 
-	// ensure we have AWS auth
-	auth, err := aws.GetAuth(*awsAccessKeyId, *awsSecretAccessKey, "", time.Now())
-	if err != nil {
-		log.Fatal(err)
+	// use any AWS auth we have
+	auth := aws.NewConfig()
+	if *awsAccessKeyId != "" && *awsSecretAccessKey != "" {
+		auth = auth.WithCredentials(credentials.NewStaticCredentials(*awsAccessKeyId, *awsSecretAccessKey, ""))
 	}
 
 	// set up clients
-	s3c := s3.New(auth, region)
-	sqc := sqs.New(auth, region)
+	s3c := s3.New(sess, auth)
+	sqc := sqs.New(sess, auth)
 
 	// set up the Mirror
 	mirror := Mirror{
-		Bucket:    s3c.Bucket(*bucketName),
-		LocalPath: *localPath,
-		Workers:   4,
+		S3:         s3c,
+		BucketName: *bucketName,
+		SQS:        sqc,
+		LocalPath:  *localPath,
+		Workers:    4,
 	}
 
-	// get the queue, which apparently can fail
-	if queueName != nil && *queueName != "" {
-		if queue, err := sqc.GetQueue(*queueName); err != nil {
+	if *queueName != "" {
+		// find the SQS queue
+		getQueue := sqs.GetQueueUrlInput{
+			QueueName: aws.String(*queueName),
+		}
+		if getQueueResp, err := sqc.GetQueueUrl(&getQueue); err != nil {
 			log.Fatal(err)
 		} else {
-			mirror.Queue = queue
+			mirror.QueueURL = *getQueueResp.QueueUrl
 		}
 	}
 
-	log.Printf("performing initial sync on S3 bucket %q", *bucketName)
+	log.Printf("performing initial sync on S3 bucket %q", mirror.BucketName)
 	nextSync := time.Now().Add(6 * time.Hour)
 	if err := mirror.Sync(); err != nil {
 		log.Fatal(err)
 	}
 
-	if mirror.Queue != nil {
+	if mirror.QueueURL != "" {
 		log.Printf("long-polling SQS queue")
 		for {
 			if err := mirror.Poll(); err != nil {

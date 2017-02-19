@@ -4,49 +4,62 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"code.google.com/p/go-uuid/uuid"
-	"github.com/crowdmob/goamz/s3"
-	"github.com/crowdmob/goamz/sqs"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/sqs"
 )
 
 type Mirror struct {
-	Bucket    *s3.Bucket
-	Queue     *sqs.Queue
+	S3         *s3.S3
+	BucketName string
+
+	SQS      *sqs.SQS
+	QueueURL string
+
 	LocalPath string
 	Workers   int
 }
 
 func (m *Mirror) Poll() error {
-	params := map[string]string{
-		"MaxNumberOfMessages": strconv.Itoa(m.Workers),
-		"VisibilityTimeout":   strconv.Itoa(60),
-		"WaitTimeSeconds":     strconv.Itoa(20),
+	req := sqs.ReceiveMessageInput{
+		QueueUrl:            &m.QueueURL,
+		MaxNumberOfMessages: aws.Int64(int64(m.Workers)),
+		VisibilityTimeout:   aws.Int64(60),
+		WaitTimeSeconds:     aws.Int64(20),
 	}
 
-	smr, err := m.Queue.ReceiveMessageWithParameters(params)
+	resp, err := m.SQS.ReceiveMessage(&req)
 	if err != nil {
 		return err
 	}
 
-	for _, msg := range smr.Messages {
+	for _, msg := range resp.Messages {
 		if err := m.handleMessage(msg); err != nil {
 			return err
-		} else if _, err := m.Queue.DeleteMessage(&msg); err != nil {
+		}
+
+		// handled, attempt to delete
+		dreq := sqs.DeleteMessageInput{
+			QueueUrl:      &m.QueueURL,
+			ReceiptHandle: msg.ReceiptHandle,
+		}
+		if _, err := m.SQS.DeleteMessage(&dreq); err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
-func (m *Mirror) handleMessage(msg sqs.Message) error {
+func (m *Mirror) handleMessage(msg *sqs.Message) error {
 	var snsMsg struct {
 		Type    string
 		Subject string
@@ -54,8 +67,8 @@ func (m *Mirror) handleMessage(msg sqs.Message) error {
 	}
 
 	// unpack the message body
-	if err := json.Unmarshal([]byte(msg.Body), &snsMsg); err != nil {
-		log.Printf("error unmarshalling SNS message: %+q\nmsgattrs: %+v\nattrs: %+v\n\n", msg.Body, msg.MessageAttribute, msg.Attribute)
+	if err := json.Unmarshal([]byte(*msg.Body), &snsMsg); err != nil {
+		log.Printf("error unmarshalling SNS message: %+q\nmsgattrs: %+v\nattrs: %+v\n\n", msg.Body, msg.MessageAttributes, msg.Attributes)
 		return err
 	}
 
@@ -63,7 +76,7 @@ func (m *Mirror) handleMessage(msg sqs.Message) error {
 	case "Amazon S3 Notification":
 		return m.handleS3Message(snsMsg.Message)
 	default:
-		log.Printf("unhandled subject %q:\nmsg: %+q\nmsgattrs: %+v\nattrs: %+v\n\n", snsMsg.Subject, msg.Body, msg.MessageAttribute, msg.Attribute)
+		log.Printf("unhandled subject %q:\nmsg: %+q\nmsgattrs: %+v\nattrs: %+v\n\n", snsMsg.Subject, msg.Body, msg.MessageAttributes, msg.Attributes)
 	}
 
 	return nil
@@ -95,10 +108,10 @@ func (m *Mirror) handleS3Message(msg string) error {
 	}
 
 	for _, record := range s3msg.Records {
-		key := s3.Key{
-			Key:  record.S3.Object.Key,
-			Size: record.S3.Object.Size,
-			ETag: record.S3.Object.ETag,
+		key := s3.Object{
+			Key:  aws.String(record.S3.Object.Key),
+			Size: aws.Int64(record.S3.Object.Size),
+			ETag: aws.String(record.S3.Object.ETag),
 		}
 
 		if strings.HasPrefix(record.EventName, "ObjectCreated:") {
@@ -120,7 +133,7 @@ func (m *Mirror) Sync() error {
 	// TODO: delete local files that no longer exist in S3
 
 	// set up a worker pool
-	keyChan := make(chan s3.Key)
+	keyChan := make(chan s3.Object)
 	errorChan := make(chan error)
 	wg := &sync.WaitGroup{}
 	for i := 0; i < m.Workers; i++ {
@@ -151,14 +164,20 @@ func (m *Mirror) Sync() error {
 	return firstError
 }
 
-func (m *Mirror) syncListWorker(keyChan chan<- s3.Key, errorChan chan<- error, wg *sync.WaitGroup) {
+func (m *Mirror) syncListWorker(keyChan chan<- s3.Object, errorChan chan<- error, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer close(keyChan)
 
 	// list the bucket, iterating on marker
-	marker := ""
+	var marker *string
 	for {
-		resp, err := m.Bucket.List("", "", marker, 500)
+		req := s3.ListObjectsInput{
+			Bucket:  aws.String(m.BucketName),
+			Marker:  marker,
+			MaxKeys: aws.Int64(500),
+		}
+
+		resp, err := m.S3.ListObjects(&req)
 		if err != nil {
 			errorChan <- err
 			return
@@ -166,10 +185,10 @@ func (m *Mirror) syncListWorker(keyChan chan<- s3.Key, errorChan chan<- error, w
 
 		for _, key := range resp.Contents {
 			// attempt to sync this key
-			keyChan <- key
+			keyChan <- *key
 		}
 
-		if resp.IsTruncated && marker != resp.NextMarker {
+		if (resp.IsTruncated != nil && *resp.IsTruncated) && marker != resp.NextMarker {
 			// we need to make a subsequent request
 			marker = resp.NextMarker
 		} else {
@@ -179,7 +198,7 @@ func (m *Mirror) syncListWorker(keyChan chan<- s3.Key, errorChan chan<- error, w
 	}
 }
 
-func (m *Mirror) syncKeyWorker(keyChan <-chan s3.Key, errorChan chan<- error, wg *sync.WaitGroup) {
+func (m *Mirror) syncKeyWorker(keyChan <-chan s3.Object, errorChan chan<- error, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	for key := range keyChan {
@@ -189,8 +208,8 @@ func (m *Mirror) syncKeyWorker(keyChan <-chan s3.Key, errorChan chan<- error, wg
 	}
 }
 
-func (m *Mirror) syncKey(key s3.Key) error {
-	localFile := filepath.Join(m.LocalPath, key.Key)
+func (m *Mirror) syncKey(key s3.Object) error {
+	localFile := filepath.Join(m.LocalPath, *key.Key)
 
 	// equality check
 	if fi, err := os.Stat(localFile); err != nil {
@@ -214,17 +233,14 @@ func (m *Mirror) syncKey(key s3.Key) error {
 			return fmt.Errorf("expected %+q to be a file, is a directory", localFile)
 		}
 
-		if fi.Size() != key.Size {
+		if fi.Size() != *key.Size {
 			// download
 			return m.downloadObject(key)
 		}
 
 		// do we have an mtime?
-		if key.LastModified != "" {
-			// parse it
-			if keyMtime, err := time.Parse("2006-01-02T15:04:05.000Z", key.LastModified); err != nil {
-				return err
-			} else if keyMtime.UTC().Truncate(time.Second) == fi.ModTime().UTC().Truncate(time.Second) {
+		if key.LastModified != nil {
+			if key.LastModified.UTC().Truncate(time.Second) == fi.ModTime().UTC().Truncate(time.Second) {
 				// close enough!
 			} else {
 				// time is too different
@@ -239,48 +255,50 @@ func (m *Mirror) syncKey(key s3.Key) error {
 	}
 }
 
-func (m *Mirror) downloadObject(key s3.Key) error {
-	localFile := filepath.Join(m.LocalPath, key.Key)
+func (m *Mirror) downloadObject(key s3.Object) error {
+	localFile := filepath.Join(m.LocalPath, *key.Key)
 
 	// make a local tempfile
-	tempfile := fmt.Sprintf("%s.tmp.%s", localFile, uuid.NewRandom().String())
-	file, err := os.OpenFile(tempfile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	tempfile, err := ioutil.TempFile(filepath.Dir(localFile), filepath.Base(localFile))
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tempfile)
-	defer file.Close()
+	defer os.Remove(tempfile.Name())
+	defer tempfile.Close()
 
 	// read the key
 	log.Printf("downloading %q (ETag: %q)", key.Key, key.ETag)
-	params := map[string][]string{"If-Match": []string{key.ETag}}
-	rc, err := m.Bucket.GetResponseWithHeaders(key.Key, params)
+	getObject := s3.GetObjectInput{
+		Bucket:  &m.BucketName,
+		IfMatch: key.ETag,
+	}
+	getObjectResp, err := m.S3.GetObject(&getObject)
 	if err != nil {
 		return err
 	}
-	defer rc.Body.Close()
+	defer getObjectResp.Body.Close()
 
 	// get the mtime off the HTTP response
-	mtime, err := time.Parse(time.RFC1123, rc.Header.Get("Last-Modified"))
-	if err != nil {
-		return err
+	if getObjectResp.LastModified == nil {
+		log.Fatal("last-modified is nil")
 	}
+	mtime := *getObjectResp.LastModified
 
 	// copy all the bits
-	if _, err := io.Copy(file, rc.Body); err != nil {
+	if _, err := io.Copy(tempfile, getObjectResp.Body); err != nil {
 		return err
 	}
 
 	// close all the things
-	if err := file.Close(); err != nil {
+	if err := tempfile.Close(); err != nil {
 		return err
 	}
 
 	// set the file's mtime
-	os.Chtimes(file.Name(), mtime, mtime)
+	os.Chtimes(tempfile.Name(), mtime, mtime)
 
-	// rename
-	if err := os.Rename(file.Name(), localFile); err != nil {
+	// rename into place
+	if err := os.Rename(tempfile.Name(), localFile); err != nil {
 		return err
 	}
 
