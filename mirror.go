@@ -298,6 +298,9 @@ func (m *Mirror) downloadObject(key s3.Object) error {
 	// set the file's mtime
 	os.Chtimes(tempfile.Name(), mtime, mtime)
 
+	// set the permissions
+	os.Chmod(tempfile.Name(), 0644)
+
 	// rename into place
 	if err := os.Rename(tempfile.Name(), localFile); err != nil {
 		return err
