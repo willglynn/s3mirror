@@ -267,9 +267,10 @@ func (m *Mirror) downloadObject(key s3.Object) error {
 	defer tempfile.Close()
 
 	// read the key
-	log.Printf("downloading %q (ETag: %q)", key.Key, key.ETag)
+	log.Printf("downloading %q (ETag: %q)", *key.Key, *key.ETag)
 	getObject := s3.GetObjectInput{
 		Bucket:  &m.BucketName,
+		Key:     key.Key,
 		IfMatch: key.ETag,
 	}
 	getObjectResp, err := m.S3.GetObject(&getObject)
